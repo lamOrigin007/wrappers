@@ -10,6 +10,7 @@
 #include "access/htup_details.h"
 #include "executor/executor.h"
 #include "utils/rel.h"
+#include "icebergc_hms.h"
 
 PG_MODULE_MAGIC;
 
@@ -101,6 +102,22 @@ icebergcBeginForeignScan(ForeignScanState *node, int eflags)
         icebergcGetOptions(RelationGetRelid(rel), table->serverid);
 
     node->fdw_state = (void *) opts;
+
+    /* Example: load schema from Hive Metastore */
+    int col_count = 0;
+    PGColInfo *cols = load_iceberg_table_schema("sample_db",
+                                                "sample_namespace",
+                                                "sample_table",
+                                                &col_count);
+    if (cols)
+    {
+        for (int i = 0; i < col_count; i++)
+        {
+            pfree(cols[i].name);
+            pfree(cols[i].type);
+        }
+        pfree(cols);
+    }
 }
 
 static TupleTableSlot *
