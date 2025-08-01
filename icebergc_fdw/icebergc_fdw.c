@@ -25,6 +25,19 @@ static void icebergcBeginForeignScan(ForeignScanState *node, int eflags);
 static TupleTableSlot *icebergcIterateForeignScan(ForeignScanState *node);
 static void icebergcEndForeignScan(ForeignScanState *node);
 
+typedef struct IcebergcFdwOptions
+{
+    char *aws_access_key_id;
+    char *aws_secret_access_key;
+    char *region;
+    char *catalog_uri;
+    char *warehouse;
+    char *s3_endpoint;
+} IcebergcFdwOptions;
+
+static IcebergcFdwOptions *icebergcGetOptions(Oid foreigntableid,
+                                               Oid serverid);
+
 Datum
 icebergc_fdw_handler(PG_FUNCTION_ARGS)
 {
@@ -81,6 +94,13 @@ icebergcGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntablei
 static void
 icebergcBeginForeignScan(ForeignScanState *node, int eflags)
 {
+    Relation rel = node->ss.ss_currentRelation;
+    ForeignTable *table = GetForeignTable(RelationGetRelid(rel));
+
+    IcebergcFdwOptions *opts =
+        icebergcGetOptions(RelationGetRelid(rel), table->serverid);
+
+    node->fdw_state = (void *) opts;
 }
 
 static TupleTableSlot *
@@ -93,5 +113,44 @@ icebergcIterateForeignScan(ForeignScanState *node)
 static void
 icebergcEndForeignScan(ForeignScanState *node)
 {
+    if (node->fdw_state)
+    {
+        pfree(node->fdw_state);
+        node->fdw_state = NULL;
+    }
+}
+
+static IcebergcFdwOptions *
+icebergcGetOptions(Oid foreigntableid, Oid serverid)
+{
+    IcebergcFdwOptions *opts = palloc0(sizeof(IcebergcFdwOptions));
+    List       *options = NIL;
+    ListCell   *lc;
+
+    ForeignTable *table = GetForeignTable(foreigntableid);
+    ForeignServer *server = GetForeignServer(serverid);
+
+    options = list_concat(options, table->options);
+    options = list_concat(options, server->options);
+
+    foreach(lc, options)
+    {
+        DefElem *def = (DefElem *) lfirst(lc);
+
+        if (strcmp(def->defname, "aws_access_key_id") == 0)
+            opts->aws_access_key_id = pstrdup(defGetString(def));
+        else if (strcmp(def->defname, "aws_secret_access_key") == 0)
+            opts->aws_secret_access_key = pstrdup(defGetString(def));
+        else if (strcmp(def->defname, "region") == 0)
+            opts->region = pstrdup(defGetString(def));
+        else if (strcmp(def->defname, "catalog_uri") == 0)
+            opts->catalog_uri = pstrdup(defGetString(def));
+        else if (strcmp(def->defname, "warehouse") == 0)
+            opts->warehouse = pstrdup(defGetString(def));
+        else if (strcmp(def->defname, "s3_endpoint") == 0)
+            opts->s3_endpoint = pstrdup(defGetString(def));
+    }
+
+    return opts;
 }
 
