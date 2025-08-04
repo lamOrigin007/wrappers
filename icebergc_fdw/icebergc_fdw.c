@@ -14,6 +14,7 @@
 #include "utils/lsyscache.h"
 #include "nodes/primnodes.h"
 #include "icebergc_hms.h"
+#include "parquet_utils.h"
 
 PG_MODULE_MAGIC;
 
@@ -59,6 +60,9 @@ typedef struct IcebergScanState
     IcebergcFdwOptions *opts;
     List *filters;      /* list of IcebergFilter* */
     List *columns;      /* list of column names */
+    ParquetReader *reader;    /* current parquet reader */
+    AttInMetadata *attinmeta; /* attribute input metadata */
+    char **values;            /* row buffer */
 } IcebergScanState;
 
 static List *extract_filters(Relation rel, List *quals);
@@ -275,6 +279,15 @@ icebergcBeginForeignScan(ForeignScanState *node, int eflags)
     state->filters = extract_filters(rel, fsplan->scan.plan.qual);
     state->columns = extract_projection(rel, fsplan->fs_targetlist);
 
+    TupleDesc tupdesc = RelationGetDescr(rel);
+    state->attinmeta = TupleDescGetAttInMetadata(tupdesc);
+    state->values = (char **) palloc0(tupdesc->natts * sizeof(char *));
+    if (state->opts && state->opts->catalog_uri)
+        state->reader = parquet_reader_open(state->opts->catalog_uri);
+    if (!state->reader)
+        ereport(ERROR,
+                (errmsg("could not open parquet file")));
+
     if (state->filters)
     {
         ListCell *lc;
@@ -300,8 +313,38 @@ icebergcBeginForeignScan(ForeignScanState *node, int eflags)
 static TupleTableSlot *
 icebergcIterateForeignScan(ForeignScanState *node)
 {
-    ExecClearTuple(node->ss.ss_ScanTupleSlot);
-    return NULL;
+    IcebergScanState *state = (IcebergScanState *) node->fdw_state;
+    TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
+    int natts = slot->tts_tupleDescriptor->natts;
+
+    ExecClearTuple(slot);
+
+    if (!parquet_reader_next(state->reader, state->values, natts))
+        return slot;
+
+    Datum *values = slot->tts_values;
+    bool *nulls = slot->tts_isnull;
+
+    for (int i = 0; i < natts; i++)
+    {
+        if (state->values[i] == NULL)
+        {
+            nulls[i] = true;
+        }
+        else
+        {
+            values[i] = InputFunctionCall(&(state->attinmeta->attinfuncs[i]),
+                                          state->values[i],
+                                          state->attinmeta->attioparams[i],
+                                          state->attinmeta->atttypmods[i]);
+            nulls[i] = false;
+            pfree(state->values[i]);
+            state->values[i] = NULL;
+        }
+    }
+
+    ExecStoreVirtualTuple(slot);
+    return slot;
 }
 
 static void
@@ -310,6 +353,16 @@ icebergcEndForeignScan(ForeignScanState *node)
     IcebergScanState *state = (IcebergScanState *) node->fdw_state;
     if (state)
     {
+        if (state->reader)
+            parquet_reader_close(state->reader);
+        if (state->values)
+        {
+            TupleDesc desc = RelationGetDescr(node->ss.ss_currentRelation);
+            for (int i = 0; i < desc->natts; i++)
+                if (state->values[i])
+                    pfree(state->values[i]);
+            pfree(state->values);
+        }
         ListCell *lc;
         foreach(lc, state->filters)
         {

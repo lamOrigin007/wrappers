@@ -10,6 +10,14 @@
 
 #include <stdexcept>
 #include <algorithm>
+#include <fstream>
+#include <limits>
+#include <cstring>
+
+extern "C" {
+#include "postgres.h"
+#include "utils/palloc.h"
+}
 
 std::vector<uint8_t> download_s3_to_buffer(const std::string &bucket,
                                            const std::string &key) {
@@ -125,5 +133,78 @@ std::vector<RowTuple> parse_parquet_buffer(const uint8_t *data,
     }
 
     return rows;
+}
+
+struct ParquetReader {
+    std::vector<RowTuple> rows;
+    size_t index;
+};
+
+static std::string column_value_to_string(const ColumnValue &cell) {
+    switch (cell.type) {
+    case ColumnValue::BOOL:
+        return std::get<bool>(cell.value) ? "t" : "f";
+    case ColumnValue::INT32:
+        return std::to_string(std::get<int32_t>(cell.value));
+    case ColumnValue::INT64:
+        return std::to_string(std::get<int64_t>(cell.value));
+    case ColumnValue::FLOAT:
+        return std::to_string(std::get<float>(cell.value));
+    case ColumnValue::DOUBLE:
+        return std::to_string(std::get<double>(cell.value));
+    case ColumnValue::STRING:
+    case ColumnValue::DECIMAL:
+        return std::get<std::string>(cell.value);
+    case ColumnValue::TIMESTAMP:
+        return std::to_string(std::get<int64_t>(cell.value));
+    default:
+        return "";
+    }
+}
+
+extern "C" ParquetReader *parquet_reader_open(const char *path) {
+    std::vector<uint8_t> data;
+    std::string spath(path);
+    if (spath.rfind("s3://", 0) == 0) {
+        auto pos = spath.find('/', 5);
+        std::string bucket = spath.substr(5, pos - 5);
+        std::string key = spath.substr(pos + 1);
+        data = download_s3_to_buffer(bucket, key);
+    } else if (spath.rfind("hdfs://", 0) == 0) {
+        data = download_hdfs_to_buffer(spath);
+    } else {
+        std::ifstream file(path, std::ios::binary);
+        if (!file)
+            return NULL;
+        data = std::vector<uint8_t>(std::istreambuf_iterator<char>(file),
+                                    std::istreambuf_iterator<char>());
+    }
+
+    auto rows = parse_parquet_buffer(data.data(), data.size(),
+                                     std::numeric_limits<size_t>::max());
+
+    ParquetReader *reader = new ParquetReader();
+    reader->rows = std::move(rows);
+    reader->index = 0;
+    return reader;
+}
+
+extern "C" bool parquet_reader_next(ParquetReader *reader, char **values, int ncols) {
+    if (!reader || reader->index >= reader->rows.size())
+        return false;
+
+    const RowTuple &row = reader->rows[reader->index++];
+    int cols = std::min<int>(ncols, row.columns.size());
+    for (int i = 0; i < cols; ++i) {
+        std::string s = column_value_to_string(row.columns[i]);
+        values[i] = pstrdup(s.c_str());
+    }
+    for (int i = cols; i < ncols; ++i)
+        values[i] = NULL;
+    return true;
+}
+
+extern "C" void parquet_reader_close(ParquetReader *reader) {
+    delete reader;
 }
 

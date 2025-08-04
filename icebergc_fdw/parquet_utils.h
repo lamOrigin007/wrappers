@@ -1,6 +1,7 @@
 #ifndef PARQUET_UTILS_H
 #define PARQUET_UTILS_H
 
+#ifdef __cplusplus
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -25,4 +26,20 @@ std::vector<RowTuple> parse_parquet_buffer(const uint8_t *data,
                                            size_t length,
                                            size_t max_rows);
 
+extern "C" {
+#endif
+
+#include <stdbool.h>
+
+typedef struct ParquetReader ParquetReader;
+
+ParquetReader *parquet_reader_open(const char *path);
+bool parquet_reader_next(ParquetReader *reader, char **values, int ncols);
+void parquet_reader_close(ParquetReader *reader);
+
+#ifdef __cplusplus
+}
+#endif
+
 #endif // PARQUET_UTILS_H
+
