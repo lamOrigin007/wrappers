@@ -10,6 +10,9 @@
 #include "access/htup_details.h"
 #include "executor/executor.h"
 #include "utils/rel.h"
+#include "utils/builtins.h"
+#include "utils/lsyscache.h"
+#include "nodes/primnodes.h"
 #include "icebergc_hms.h"
 
 PG_MODULE_MAGIC;
@@ -35,6 +38,33 @@ typedef struct IcebergcFdwOptions
     char *warehouse;
     char *s3_endpoint;
 } IcebergcFdwOptions;
+
+typedef enum
+{
+    ICEBERG_FILTER_OP,
+    ICEBERG_FILTER_BETWEEN
+} IcebergFilterKind;
+
+typedef struct IcebergFilter
+{
+    IcebergFilterKind kind;
+    char *column;
+    char *op;      /* used when kind == ICEBERG_FILTER_OP */
+    char *val1;
+    char *val2;    /* used for BETWEEN */
+} IcebergFilter;
+
+typedef struct IcebergScanState
+{
+    IcebergcFdwOptions *opts;
+    List *filters;      /* list of IcebergFilter* */
+    List *columns;      /* list of column names */
+} IcebergScanState;
+
+static List *extract_filters(Relation rel, List *quals);
+static List *extract_projection(Relation rel, List *tlist);
+static char *datum_to_cstring(Datum d, Oid typeoid);
+static bool list_member_str(List *list, const char *str);
 
 static IcebergcFdwOptions *icebergcGetOptions(Oid foreigntableid,
                                                Oid serverid);
@@ -89,7 +119,147 @@ icebergcGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntablei
 {
     scan_clauses = extract_actual_clauses(scan_clauses, false);
     return make_foreignscan(tlist, scan_clauses, baserel->relid,
-                            NIL, NIL, NIL, NIL, outer_plan);
+                            NIL, NIL, tlist, NIL, outer_plan);
+}
+
+static char *
+datum_to_cstring(Datum d, Oid typeoid)
+{
+    Oid typoutput;
+    bool typisvarlena;
+    getTypeOutputInfo(typeoid, &typoutput, &typisvarlena);
+    return OidOutputFunctionCall(typoutput, d);
+}
+
+static IcebergFilter *
+make_op_filter(Relation rel, OpExpr *op)
+{
+    Node *larg = linitial(op->args);
+    Node *rarg = lsecond(op->args);
+    Var *var = NULL;
+    Const *cst = NULL;
+
+    if (IsA(larg, Var) && IsA(rarg, Const))
+    {
+        var = (Var *) larg;
+        cst = (Const *) rarg;
+    }
+    else if (IsA(rarg, Var) && IsA(larg, Const))
+    {
+        var = (Var *) rarg;
+        cst = (Const *) larg;
+    }
+    if (!var || !cst)
+        return NULL;
+
+    IcebergFilter *f = palloc0(sizeof(IcebergFilter));
+    f->kind = ICEBERG_FILTER_OP;
+    f->column = pstrdup(get_attname(RelationGetRelid(rel), var->varattno, false));
+    f->op = pstrdup(get_opname(op->opno));
+    f->val1 = datum_to_cstring(cst->constvalue, cst->consttype);
+    return f;
+}
+
+static bool
+is_between_clause(Relation rel, Expr *e1, Expr *e2, IcebergFilter **out)
+{
+    if (!IsA(e1, OpExpr) || !IsA(e2, OpExpr))
+        return false;
+    IcebergFilter *f1 = make_op_filter(rel, (OpExpr *) e1);
+    IcebergFilter *f2 = make_op_filter(rel, (OpExpr *) e2);
+    if (!f1 || !f2)
+        return false;
+    if (strcmp(f1->column, f2->column) != 0)
+        return false;
+    if (!((strcmp(f1->op, ">=") == 0 && strcmp(f2->op, "<=") == 0) ||
+          (strcmp(f1->op, "<=") == 0 && strcmp(f2->op, ">=") == 0)))
+        return false;
+    IcebergFilter *f = palloc0(sizeof(IcebergFilter));
+    f->kind = ICEBERG_FILTER_BETWEEN;
+    f->column = f1->column;
+    if (strcmp(f1->op, ">=") == 0)
+    {
+        f->val1 = f1->val1;
+        f->val2 = f2->val1;
+        pfree(f2->column);
+    }
+    else
+    {
+        f->val1 = f2->val1;
+        f->val2 = f1->val1;
+        pfree(f1->column);
+    }
+    pfree(f1->op); pfree(f1); pfree(f2->op); pfree(f2);
+    *out = f;
+    return true;
+}
+
+static void
+append_filter(Relation rel, Expr *expr, List **out)
+{
+    if (IsA(expr, OpExpr))
+    {
+        IcebergFilter *f = make_op_filter(rel, (OpExpr *) expr);
+        if (f)
+            *out = lappend(*out, f);
+    }
+    else if (IsA(expr, BoolExpr))
+    {
+        BoolExpr *b = (BoolExpr *) expr;
+        if (b->boolop == AND && list_length(b->args) == 2)
+        {
+            IcebergFilter *bf;
+            if (is_between_clause(rel, linitial(b->args), lsecond(b->args), &bf))
+            {
+                *out = lappend(*out, bf);
+                return;
+            }
+        }
+        ListCell *lc;
+        foreach(lc, b->args)
+            append_filter(rel, (Expr *) lfirst(lc), out);
+    }
+}
+
+static List *
+extract_filters(Relation rel, List *quals)
+{
+    List *result = NIL;
+    ListCell *lc;
+    foreach(lc, quals)
+        append_filter(rel, (Expr *) lfirst(lc), &result);
+    return result;
+}
+
+static bool
+list_member_str(List *list, const char *str)
+{
+    ListCell *lc;
+    foreach(lc, list)
+        if (strcmp((const char *) lfirst(lc), str) == 0)
+            return true;
+    return false;
+}
+
+static List *
+extract_projection(Relation rel, List *tlist)
+{
+    List *cols = NIL;
+    ListCell *lc;
+    foreach(lc, tlist)
+    {
+        TargetEntry *tle = (TargetEntry *) lfirst(lc);
+        if (tle->resjunk)
+            continue;
+        if (IsA(tle->expr, Var))
+        {
+            Var *var = (Var *) tle->expr;
+            char *name = get_attname(RelationGetRelid(rel), var->varattno, false);
+            if (!list_member_str(cols, name))
+                cols = lappend(cols, pstrdup(name));
+        }
+    }
+    return cols;
 }
 
 static void
@@ -98,26 +268,33 @@ icebergcBeginForeignScan(ForeignScanState *node, int eflags)
     Relation rel = node->ss.ss_currentRelation;
     ForeignTable *table = GetForeignTable(RelationGetRelid(rel));
 
-    IcebergcFdwOptions *opts =
-        icebergcGetOptions(RelationGetRelid(rel), table->serverid);
+    IcebergScanState *state = palloc0(sizeof(IcebergScanState));
+    state->opts = icebergcGetOptions(RelationGetRelid(rel), table->serverid);
 
-    node->fdw_state = (void *) opts;
+    ForeignScan *fsplan = (ForeignScan *) node->ss.ps.plan;
+    state->filters = extract_filters(rel, fsplan->scan.plan.qual);
+    state->columns = extract_projection(rel, fsplan->fs_targetlist);
 
-    /* Example: load schema from Hive Metastore */
-    int col_count = 0;
-    PGColInfo *cols = load_iceberg_table_schema("sample_db",
-                                                "sample_namespace",
-                                                "sample_table",
-                                                &col_count);
-    if (cols)
+    if (state->filters)
     {
-        for (int i = 0; i < col_count; i++)
+        ListCell *lc;
+        foreach(lc, state->filters)
         {
-            pfree(cols[i].name);
-            pfree(cols[i].type);
+            IcebergFilter *f = (IcebergFilter *) lfirst(lc);
+            if (f->kind == ICEBERG_FILTER_BETWEEN)
+                elog(DEBUG1, "filter: %s BETWEEN %s AND %s", f->column, f->val1, f->val2);
+            else
+                elog(DEBUG1, "filter: %s %s %s", f->column, f->op, f->val1);
         }
-        pfree(cols);
     }
+    if (state->columns)
+    {
+        ListCell *lc;
+        foreach(lc, state->columns)
+            elog(DEBUG1, "project column: %s", (char *) lfirst(lc));
+    }
+
+    node->fdw_state = (void *) state;
 }
 
 static TupleTableSlot *
@@ -130,9 +307,29 @@ icebergcIterateForeignScan(ForeignScanState *node)
 static void
 icebergcEndForeignScan(ForeignScanState *node)
 {
-    if (node->fdw_state)
+    IcebergScanState *state = (IcebergScanState *) node->fdw_state;
+    if (state)
     {
-        pfree(node->fdw_state);
+        ListCell *lc;
+        foreach(lc, state->filters)
+        {
+            IcebergFilter *f = (IcebergFilter *) lfirst(lc);
+            pfree(f->column);
+            if (f->op)
+                pfree(f->op);
+            if (f->val1)
+                pfree(f->val1);
+            if (f->val2)
+                pfree(f->val2);
+            pfree(f);
+        }
+        list_free(state->filters);
+        foreach(lc, state->columns)
+            pfree(lfirst(lc));
+        list_free(state->columns);
+        if (state->opts)
+            pfree(state->opts);
+        pfree(state);
         node->fdw_state = NULL;
     }
 }
